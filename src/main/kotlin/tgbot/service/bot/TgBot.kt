@@ -9,29 +9,31 @@ import com.github.kotlintelegrambot.dispatcher.text
 import com.github.kotlintelegrambot.entities.*
 import com.github.kotlintelegrambot.entities.keyboard.InlineKeyboardButton
 import mu.KLogging
+import org.springframework.beans.factory.ObjectProvider
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.stereotype.Component
+import tgbot.service.config.Role
 import tgbot.service.model.NotificationDto
 import tgbot.service.service.TgBotService
+import tgbot.service.session.UserSession
+import tgbot.service.session.context.UserSessionContext
 import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
 
 @Component
 class TgBot(
-    @Value("\${bot.token}")
-    private val token: String,
-    private val tgBotService: TgBotService
+    @Value("\${bot.token}") private val token: String,
+    private val tgBotService: TgBotService,
+    //private val userSessionProvider: ObjectProvider<UserSession>
 ) {
-
     companion object : KLogging()
 
-    // Сохраняем выбранный день для каждого пользователя
+    //private val userSessions = ConcurrentHashMap<Long, UserSession>()
     private val userSelectedDays = ConcurrentHashMap<Long, Int>()
 
     @Bean
     fun getBot(): Bot {
-
         val bot = bot {
             token = this@TgBot.token
             timeout = 60
@@ -41,18 +43,30 @@ class TgBot(
                     val chatId = update.message?.chat?.id ?: return@command
                     val nickname = update.message?.from?.username ?: "Без имени"
 
-                    // Логируем информацию о пользователе
-                    logger.info { "Получена команда /start от пользователя: $nickname (chatId: $chatId)" }
+                    startUserSession(chatId, nickname)
+                    val userSession = UserSessionContext.getCurrentSession()
 
-                    bot.sendMessage(ChatId.fromId(chatId), "Добро пожаловать! Это бот для операций с заметками, для того чтобы узнать, что может этот бот, введите /help.")
+                    bot.sendMessage(
+                        ChatId.fromId(chatId),
+                        "Добро пожаловать! Это бот для операций с заметками, введите /help для списка команд."
+                    )
 
-                    // Создание пользователя при первом взаимодействии
-                    tgBotService.createUserIfNotExists(chatId, nickname)
+                    if (userSession != null) {
+
+                        try {
+                            tgBotService.createUserIfNotExists(chatId, nickname)
+                            logger.info{"CurrentUserSession: ${userSession.info()}"}
+
+                        } catch (e: Exception) {
+                            logger.error(e) { "Ошибка при вызове createUserIfNotExists для chatId: $chatId, Nickname: $nickname" }
+                        }
+                    }
                 }
 
                 command("help") {
                     val chatId = update.message?.chat?.id ?: return@command
-                    val helpMessage = """
+                    val userSession = UserSessionContext.getCurrentSession()
+                    var helpMessage = """
                         Доступные команды:
                         
                         /start - Начать работу с ботом.
@@ -60,31 +74,35 @@ class TgBot(
                         /search [текст] - Найти заметки по ключевому слову в тексте.
                         /find - найти заметки в календаре
                         /help - Вывести информацию обо всех командах.
+                        /list - список всех Ваших заметок
                     """.trimIndent()
 
+                    if (userSession != null) {
+                        if (userSession.role == Role.ADMIN){
+                            bot.sendMessage(ChatId.fromId(chatId), "У вас есть права админа: 'ADMIN'")
+                            helpMessage = "$helpMessage\n/delete - удалить пользователя за нарушения"
+                        }
+                    }
                     bot.sendMessage(ChatId.fromId(chatId), helpMessage)
                 }
 
                 command("new") {
                     val chatId = update.message?.chat?.id ?: return@command
-
-                    // Логируем запрос на создание новой заметки
-                    logger.info { "Получена команда /new от пользователя с chatId: $chatId" }
-
-                    // Отображение календаря для выбора даты
                     showCalendar(chatId, bot)
                 }
 
                 command("find") {
                     val chatId = update.message?.chat?.id ?: return@command
-
-                    // Логируем запрос на поиск заметок по дню
-                    logger.info { "Получена команда /getByDay от пользователя с chatId: $chatId" }
-
-                    // Отображаем календарь для выбора дня
                     showCalendar(chatId, bot, isSearch = true)
                 }
 
+                command("delete"){
+                    val userSession = UserSessionContext.getCurrentSession()
+                    val chatId = update.message?.chat?.id ?: return@command
+                    if (userSession != null) {
+                        handleDeleteCommand(chatId, bot, userSession)
+                    }
+                }
 
                 command("search") {
                     val chatId = update.message?.chat?.id ?: return@command
@@ -95,9 +113,6 @@ class TgBot(
                         return@command
                     }
 
-                    logger.info { "Получена команда /search от пользователя с chatId: $chatId, текст поиска: $queryText" }
-
-                    // Выполняем поиск через Feign-клиент
                     val searchResults = tgBotService.searchNotifications(text = queryText, day = "")
                     if (searchResults.isEmpty()) {
                         bot.sendMessage(ChatId.fromId(chatId), "Заметки не найдены по запросу: \"$queryText\".")
@@ -124,65 +139,48 @@ class TgBot(
                     val callbackData = update.callbackQuery?.data
                     val chatId = update.callbackQuery?.message?.chat?.id ?: return@callbackQuery
 
-                    // Логируем выбор даты
-                    logger.info { "Выбрана дата: $callbackData для пользователя с chatId: $chatId" }
+                    callbackData?.let { data ->
 
-                    callbackData?.let {
-                        val selectedDay = it.toInt()
-                        userSelectedDays[chatId] = selectedDay // Сохраняем выбранный день для пользователя
+                        if (data.toIntOrNull()!= null){
 
-                        // Проверяем, находится ли пользователь в процессе поиска заметок по дню
-                        if (update.callbackQuery?.message?.text == "Выберите дату для поиска заметок:") {
-                            // Если да, то вызываем поиск заметок по выбранному дню
-                            val searchResults = tgBotService.searchNotificationsByUserAndDay(userId=chatId, day=selectedDay)
-                            if (searchResults.isEmpty()) {
-                                bot.sendMessage(ChatId.fromId(chatId), "Заметки на день $selectedDay не найдены.")
-                            } else {
-                                val resultMessages = searchResults.joinToString(separator = "\n") { "${it.day}: ${it.text}" }
-                                bot.sendMessage(ChatId.fromId(chatId), "Заметки на день $selectedDay:\n$resultMessages")
+                            val selectedDay = data.toInt()
+                            userSelectedDays[chatId] = selectedDay
+
+                            if (update.callbackQuery?.message?.text == "Выберите дату для поиска заметок:") {
+                                val searchResults = tgBotService.searchNotificationsByUserAndDay(userId=chatId, day=selectedDay)
+                                if (searchResults.isEmpty()) {
+                                    bot.sendMessage(ChatId.fromId(chatId), "Заметки на день $selectedDay не найдены.")
+                                }
+                                else {
+                                    val resultMessages = searchResults.joinToString(separator = "\n") { "${it.day}: ${it.text}" }
+                                    bot.sendMessage(ChatId.fromId(chatId), "Заметки на день $selectedDay:\n$resultMessages")
+                                }
                             }
-                        } else {
-                            // Если это создание новой заметки, то запрашиваем текст заметки
-                            requestNoteText(chatId, selectedDay, bot)
+                            else {
+                                requestNoteText(chatId, selectedDay, bot)
+                            }
                         }
-                    }
-                }
 
+                    else{ handleDeleteUserCallback(chatId, data, bot) }
+
+                    }
+
+                }
 
                 text {
                     val chatId = update.message?.chat?.id ?: return@text
                     val messageText = update.message?.text ?: return@text
 
-                    // Если сообщение начинается с "/" — это команда, пропускаем её
-                    if (messageText.startsWith("/search")) {
-                        logger.info { "Получена команда /search, игнорируем обработку как текст." }
-                        return@text
-                    }
+                    if (messageText.startsWith("/")) return@text
 
-                    if (messageText.startsWith("/")) {
-                        logger.info { "Получена команда $messageText, игнорируем обработку как текст." }
-                        return@text
-                    }
-
-                    // Логируем текст заметки
-                    logger.info { "Получено текстовое сообщение от пользователя с chatId: $chatId: $messageText" }
-
-                    // Получаем ранее выбранную дату для пользователя
                     val day = userSelectedDays[chatId]
 
                     if (day != null) {
-                        // Логируем сохранение заметки
-                        logger.info { "Сохранение заметки для дня $day от пользователя с chatId: $chatId" }
-
-                        // Сохраняем заметку
-                        val notificationDto = NotificationDto( text = messageText, day = day, userId = chatId)
+                        val notificationDto = NotificationDto(text = messageText, day = day, userId = chatId)
                         bot.sendMessage(ChatId.fromId(chatId), "Заметка сохранена на день $day.")
                         tgBotService.createNotification(notificationDto)
-                        // Убираем сохранённый день, чтобы при следующем сообщении не было ошибок
                         userSelectedDays.remove(chatId)
                     } else {
-                        // Если день не был выбран, логируем предупреждение
-                        logger.warn { "День не был выбран до ввода текста заметки пользователем с chatId: $chatId" }
                         bot.sendMessage(ChatId.fromId(chatId), "Пожалуйста, выберите дату перед вводом текста заметки.")
                     }
                 }
@@ -193,27 +191,32 @@ class TgBot(
         return bot
     }
 
+    private fun startUserSession(chatId: Long, nickname: String) {
+        val userSession = UserSession(chatId, nickname, Role.USER)
+        UserSessionContext.setCurrentSession(userSession)
+        UserSessionContext.isAdmin(userSession)
+
+    }
+
     private fun showCalendar(chatId: Long, bot: Bot, isSearch: Boolean = false) {
         val currentDate = LocalDate.now()
         val today = currentDate.dayOfMonth
         val daysInMonth = currentDate.lengthOfMonth()
         val firstDayOfMonth = currentDate.withDayOfMonth(1)
-        val dayOfWeekOfFirstDay = firstDayOfMonth.dayOfWeek.value % 7 // День недели первого дня месяца (0 - воскресенье, 6 - суббота)
+        val dayOfWeekOfFirstDay = firstDayOfMonth.dayOfWeek.value % 7
 
         val buttons = mutableListOf<List<InlineKeyboardButton>>()
         var weekButtons = mutableListOf<InlineKeyboardButton>()
 
-        // Добавляем пустые кнопки до первого дня месяца
         for (i in 0 until dayOfWeekOfFirstDay) {
             weekButtons.add(InlineKeyboardButton.CallbackData(" ", "ignore"))
         }
 
-        // Заполняем кнопки днями месяца с учётом сегодняшнего и прошедших дней
         for (day in 1..daysInMonth) {
             val buttonText = when {
-                day < today -> "◀ $day" // Прошедшие дни
-                day == today -> "🔵 $day" // Сегодняшний день
-                else -> day.toString() // Будущие дни
+                day < today -> "◀ $day"
+                day == today -> "🔵 $day"
+                else -> day.toString()
             }
 
             val button = InlineKeyboardButton.CallbackData(
@@ -222,17 +225,15 @@ class TgBot(
             )
             weekButtons.add(button)
 
-            // Если собрали неделю (7 кнопок) или дошли до конца месяца — добавляем в общий список
             if (weekButtons.size == 7) {
                 buttons.add(weekButtons.toList())
                 weekButtons.clear()
             }
         }
 
-        // Добавляем остаток дней, если остались дни в последней неполной неделе
         if (weekButtons.isNotEmpty()) {
             while (weekButtons.size < 7) {
-                weekButtons.add(InlineKeyboardButton.CallbackData(" ", "ignore")) // Добавляем пустые кнопки для заполнения недели
+                weekButtons.add(InlineKeyboardButton.CallbackData(" ", "ignore"))
             }
             buttons.add(weekButtons.toList())
         }
@@ -245,16 +246,52 @@ class TgBot(
             "Выберите дату для создания заметки:"
         }
 
-        logger.info { "Показ календаря пользователю с chatId: $chatId" }
         bot.sendMessage(ChatId.fromId(chatId), messageText, replyMarkup = inlineKeyboard)
     }
 
-
-
     private fun requestNoteText(chatId: Long, day: Int, bot: Bot) {
-        // Логируем запрос текста заметки
-        logger.info { "Запрос текста заметки для дня $day у пользователя с chatId: $chatId" }
-
         bot.sendMessage(ChatId.fromId(chatId), "Введите текст заметки для дня $day:")
     }
+
+    // DELETE
+
+    private fun handleDeleteUserCallback(chatId: Long, nickname: String, bot: Bot) {
+        val response = tgBotService.deleteUserByNickname(nickname)
+        val message = if (response.statusCode.is2xxSuccessful) {
+            "Пользователь $nickname успешно удален."
+        } else {
+            "Ошибка при удалении пользователя $nickname."
+        }
+        bot.sendMessage(ChatId.fromId(chatId), message)
+    }
+
+
+
+    private fun handleDeleteCommand(chatId: Long, bot: Bot, userSession: UserSession) {
+        if (checkUserRole(userSession)){
+        val users = tgBotService.getAllUsersExcludingRequester(chatId)
+        if (users.isEmpty()) {
+            bot.sendMessage(ChatId.fromId(chatId), "Нет пользователей для удаления.")
+            return
+        }
+
+        val buttons = users.map { user ->
+            listOf(InlineKeyboardButton.CallbackData(user.nickname, user.nickname))
+        }
+
+        val inlineKeyboard = InlineKeyboardMarkup.create(buttons)
+        bot.sendMessage(
+            chatId = ChatId.fromId(chatId),
+            text = "Выберите пользователя для удаления:",
+            replyMarkup = inlineKeyboard
+        )
+        }
+        else{bot.sendMessage(chatId = ChatId.fromId(chatId), "You have not permissions for this command...")}
+    }
+
+    private fun checkUserRole(userSession: UserSession): Boolean {
+        logger.info{"Attempt to have access to admin methods: ${userSession.info()}"}
+        return userSession.role == Role.ADMIN
+    }
+
 }
